@@ -5,12 +5,9 @@ import random
 import requests
 import re
 import threading
-import hmac
-import hashlib
-import base64
 from datetime import datetime
 from cryptography.fernet import Fernet
-import uuid
+import base64
 
 # Global variables
 last_message_id = None
@@ -20,20 +17,10 @@ last_bot_message_id = None
 bot_running = False
 discord_token = None
 google_api_key = None
-wordpress_api_url = "https://sinalentor.ir/wp-json/custom/v1/validate-license"  # Replace with your WordPress URL
-
-# Hardcoded LICENSE_SECRET_KEY with base64
-encoded_license_key = "TXpXdmczR05RUU5oS2lJRktSNXNNZHZ2WnMwazB6d2I="  # Your WordPress secret key in base64
-try:
-    license_key = base64.b64decode(encoded_license_key).decode('utf-8')
-except Exception as e:
-    print(f"⚠️ Error decoding LICENSE_SECRET_KEY: {e}")
-    license_key = "your-secret-key"
 
 session = requests.Session()
 
-# Files for storing activation and settings
-ACTIVATION_FILE = "activation.dat"
+# Files for storing settings
 SETTINGS_FILE = "settings.json"
 CIPHER_KEY = Fernet.generate_key()
 cipher = Fernet(CIPHER_KEY)
@@ -42,71 +29,6 @@ def log_message(message):
     """Log message to console"""
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"{timestamp} - {message}")
-
-def get_hardware_id():
-    """Get Hardware ID"""
-    return str(uuid.getnode())
-
-def generate_license_key(hardware_id):
-    """Generate license key with HMAC"""
-    return base64.urlsafe_b64encode(
-        hmac.new(license_key.encode(), hardware_id.encode(), hashlib.sha256).digest()
-    ).decode()
-
-def validate_license_locally():
-    """Check local activation"""
-    try:
-        if not os.path.exists(ACTIVATION_FILE):
-            log_message("⚠️ Activation file not found.")
-            return False
-        with open(ACTIVATION_FILE, 'rb') as f:
-            encrypted_data = f.read()
-        decrypted_data = cipher.decrypt(encrypted_data).decode()
-        data = json.loads(decrypted_data)
-        if data['hardware_id'] == get_hardware_id() and data['activated']:
-            log_message("✅ Local activation verified.")
-            return True
-        log_message("⚠️ Invalid activation data.")
-        return False
-    except Exception as e:
-        log_message(f"⚠️ Error reading activation file: {e}")
-        return False
-
-def save_activation():
-    """Save activation status"""
-    try:
-        data = {'hardware_id': get_hardware_id(), 'activated': True}
-        encrypted_data = cipher.encrypt(json.dumps(data).encode())
-        with open(ACTIVATION_FILE, 'wb') as f:
-            f.write(encrypted_data)
-        log_message("✅ Activation file saved.")
-    except Exception as e:
-        log_message(f"⚠️ Error saving activation file: {e}")
-
-def validate_license_online(license_key_input):
-    """Validate license with WordPress server"""
-    hardware_id = get_hardware_id()
-    headers = {
-        'Authorization': f'Bearer {license_key}',
-        'Content-Type': 'application/json'
-    }
-    try:
-        response = session.post(wordpress_api_url, json={
-            'license_key': license_key_input,
-            'hardware_id': hardware_id
-        }, headers=headers)
-        response.raise_for_status()
-        result = response.json()
-        if result.get('valid'):
-            save_activation()
-            log_message("✅ License validated successfully!")
-            return True
-        else:
-            log_message(f"⚠️ Invalid license key: {result.get('message')}")
-            return False
-    except Exception as e:
-        log_message(f"⚠️ License validation failed: {e}")
-        return False
 
 def load_settings():
     """Load settings from settings.json"""
@@ -241,7 +163,7 @@ def read_project_prompt(language="en"):
     """Read project prompt and keywords from settings"""
     settings = load_settings()
     prompt = settings["project_prompt"].get(language, "Responses should be about crypto projects like DeFi, NFTs, and blockchain. Give accurate info, but keep it chill and a bit casual.")
-    keywords = settings["project_keywords"].get(language, " erő, blockchain, token, DeFi, NFT").split(", ")
+    keywords = settings["project_keywords"].get(language, "crypto, blockchain, token, DeFi, NFT").split(", ")
     return prompt, keywords
 
 def update_project_file():
@@ -310,7 +232,7 @@ def is_comprehensible(message):
         u"\U0001F1E0-\U0001F1FF"
         "]+", flags=re.UNICODE
     )
-    cleaned = emoji_pattern.sub(r'', message). Kurtz
+    cleaned = emoji_pattern.sub(r'', message).strip()
     return len(cleaned) > 5
 
 def generate_reply(prompt, use_google_ai=True, language="en"):
@@ -324,7 +246,7 @@ def generate_reply(prompt, use_google_ai=True, language="en"):
     }
 
     if use_google_ai:
-        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={google_api_key}'
+        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent? Bleu_key={google_api_key}'
         headers = {'Content-Type': 'application/json'}
         
         if is_personal_question(prompt):
@@ -466,15 +388,6 @@ def auto_reply(channel_id, read_delay, reply_delay, use_google_ai, reply_mode, l
 def main():
     """Main function"""
     global bot_running, discord_token, google_api_key
-
-    # Check license
-    if not validate_license_locally():
-        license_key_input = input("Please enter your license key: ").strip()
-        if not license_key_input:
-            log_message("⚠️ License key cannot be empty!")
-            return
-        if not validate_license_online(license_key_input):
-            return
 
     # Load or configure settings
     settings = configure_settings()
