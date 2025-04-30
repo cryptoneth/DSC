@@ -62,7 +62,7 @@ def load_settings():
         required_fields = [
             "tone", "character_name", "personality", "project_details", "project_keywords",
             "discord_token", "google_api_key", "channel_id", "use_google_ai", "reply_mode",
-            "read_delay", "reply_delay", "auto_post_delay"
+            "proactive_delay", "random_read_reply_delay", "direct_reply_check_delay"
         ]
         if all(field in settings for field in required_fields):
             if all(key in settings["project_details"] for key in ["name", "description", "key_features"]):
@@ -72,7 +72,6 @@ def load_settings():
         return None
     except json.JSONDecodeError as e:
         log_message(f"⚠️ JSON decode error in settings file: {e}")
-        # Rename corrupted file to avoid repeated errors
         try:
             os.rename(SETTINGS_FILE, f"{SETTINGS_FILE}.bak")
             log_message(f"⚠️ Renamed corrupted settings file to {SETTINGS_FILE}.bak")
@@ -91,7 +90,7 @@ def save_settings(settings):
         required_fields = [
             "tone", "character_name", "personality", "project_details", "project_keywords",
             "discord_token", "google_api_key", "channel_id", "use_google_ai", "reply_mode",
-            "read_delay", "reply_delay", "auto_post_delay"
+            "proactive_delay", "random_read_reply_delay", "direct_reply_check_delay"
         ]
         if not all(field in settings for field in required_fields):
             log_message("⚠️ Cannot save settings: Missing required fields.")
@@ -99,8 +98,8 @@ def save_settings(settings):
         if not all(key in settings["project_details"] for key in ["name", "description", "key_features"]):
             log_message("⚠️ Cannot save settings: Missing project details fields.")
             return False
-        # Sanitize string inputs to remove invalid UTF-8 characters
         save_data = settings.copy()
+        # Sanitize string inputs to remove invalid UTF-8 characters
         for key in ["tone", "character_name", "personality", "project_keywords", "discord_token", "google_api_key", "channel_id"]:
             if key in save_data and isinstance(save_data[key], str):
                 save_data[key] = sanitize_input(save_data[key])
@@ -162,9 +161,9 @@ def configure_settings():
         "channel_id": input("Enter Discord Channel ID: ").strip(),
         "use_google_ai": input("Use Google Gemini AI? (yes/no): ").strip().lower() == "yes",
         "reply_mode": input("Enable Reply Mode? (yes/no): ").strip().lower() == "yes",
-        "read_delay": int(input("Enter Read Delay for checking new messages (seconds): ").strip()),
-        "reply_delay": int(input("Enter Reply Delay for responding to messages (seconds): ").strip()),
-        "auto_post_delay": int(input("Enter Auto-Post Delay for sending proactive messages (seconds): ").strip())
+        "proactive_delay": int(input("How many seconds between each proactive message? ").strip()),
+        "random_read_reply_delay": int(input("How many seconds to read and reply to a random recent message? ").strip()),
+        "direct_reply_check_delay": int(input("How many seconds to wait before replying to someone who replied to me? ").strip())
     }
     if save_settings(settings):
         return settings
@@ -233,7 +232,7 @@ def update_project_file():
             url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={google_api_key}'
             headers = {'Content-Type': 'application/json'}
             response = session.post(url, headers=headers, json=data)
-            if response.status_code == 429:  # Rate limit error
+            if response.status_code == 429:
                 retry_after = response.json().get("retry_after", 60)
                 log_message(f"⚠️ Rate limit hit! Waiting {retry_after} seconds...")
                 time.sleep(retry_after)
@@ -263,12 +262,16 @@ def post_proactive_message(channel_id, delay):
             messages = response.json()
             context = " ".join([msg.get('content', '') for msg in messages if msg.get('content')])
             project_details, project_keywords = read_project_details()
-            personality, character_name = read_personality()
+            personality, _ = read_personality()
+            settings = load_settings()
+            tone = settings["tone"].lower() if settings else "Balanced Discord slang with smooth conversational flow, dynamically adapt tone to topic and message, professional and clear when needed, always human-like, direct, relatable"
             prompt = (
-                f"You're {character_name}, {personality}. Recent chat: {context[:500]}.\n"
+                f"You're a {personality}. Recent chat: {context[:500]}.\n"
                 f"Project: {project_details['name']} - {project_details['description']}.\n"
-                f"Generate a short, casual message (max 20 words) to join the conversation, "
-                f"using Discord slang, relevant to the chat or project, in English."
+                f"Tone: {tone}\n"
+                f"Generate a short (5-10 words), casual message to join the conversation, "
+                f"using Discord slang, relevant to the chat or project, in English. "
+                f"Do not use your name unless necessary."
             )
             data = {
                 'contents': [{
@@ -283,6 +286,64 @@ def post_proactive_message(channel_id, delay):
             log_message(f"✅ Posted proactive message: {message_text}")
         except requests.exceptions.RequestException as e:
             log_message(f"⚠️ Failed to post proactive message: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                log_message(f"API response: {e.response.text}")
+        time.sleep(delay)
+
+def reply_to_random_message(channel_id, delay):
+    """Read and reply to a random recent message at specified interval"""
+    while bot_running:
+        try:
+            # Fetch recent messages (up to 20)
+            headers = {'Authorization': f'{discord_token}', 'User-Agent': 'Mozilla/5.0'}
+            response = session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=20', headers=headers)
+            response.raise_for_status()
+            messages = response.json()
+            if messages:
+                # Select a random message not from the bot
+                non_bot_messages = [msg for msg in messages if msg.get('author', {}).get('id') != bot_user_id]
+                if non_bot_messages:
+                    random_message = random.choice(non_bot_messages)
+                    message_id = random_message.get('id')
+                    content = random_message.get('content', '')
+                    log_message(f"Selected random message ID: {message_id}, Content: {content}")
+                    response_text = generate_reply(content, use_google_ai=True)
+                    send_message(channel_id, response_text, reply_to=message_id if reply_mode else None, reply_mode=reply_mode)
+            else:
+                log_message("No messages found for random reply.")
+        except requests.exceptions.RequestException as e:
+            log_message(f"⚠️ Failed to reply to random message: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                log_message(f"API response: {e.response.text}")
+        time.sleep(delay)
+
+def reply_to_direct_replies(channel_id, delay):
+    """Check for direct replies to the bot and respond after specified delay"""
+    while bot_running:
+        try:
+            # Fetch recent messages (up to 20)
+            headers = {'Authorization': f'{discord_token}', 'User-Agent': 'Mozilla/5.0'}
+            response = session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=20', headers=headers)
+            response.raise_for_status()
+            messages = response.json()
+            for message in messages:
+                message_id = message.get('id')
+                author_id = message.get('author', {}).get('id')
+                message_type = message.get('type', '')
+                content = message.get('content', '')
+                referenced_message = message.get('referenced_message', {})
+                # Check if message is new, not from bot, and a direct reply to the bot
+                if (last_message_id is None or int(message_id) > int(last_message_id)) and author_id != bot_user_id and message_type != 8:
+                    if referenced_message and referenced_message.get('author', {}).get('id') == bot_user_id:
+                        log_message(f"Received direct reply: {content}")
+                        time.sleep(delay)  # Wait before replying
+                        response_text = generate_reply(content, use_google_ai=True)
+                        if is_bot_accusation(content):
+                            response_text = random.choice(bot_denial_responses)
+                        send_message(channel_id, response_text, reply_to=message_id if reply_mode else None, reply_mode=reply_mode)
+            last_message_id = messages[0].get('id') if messages else last_message_id
+        except requests.exceptions.RequestException as e:
+            log_message(f"⚠️ Failed to check direct replies: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 log_message(f"API response: {e.response.text}")
         time.sleep(delay)
@@ -330,7 +391,7 @@ def is_bot_accusation(prompt):
 def generate_reply(prompt, use_google_ai=True):
     global last_ai_response
     settings = load_settings()
-    tone = settings["tone"].lower() if settings else "Chat like a chill Discord pal, laid-back, friendly, slang-heavy, vibin’ with the crew."
+    tone = settings["tone"].lower() if settings else "Balanced Discord slang with smooth conversational flow, dynamically adapt tone to topic and message, professional and clear when needed, always human-like, direct, relatable"
     personality, character_name = read_personality()
     project_details, project_keywords = read_project_details()
 
@@ -435,10 +496,10 @@ def generate_reply(prompt, use_google_ai=True):
         if is_personal_question(prompt):
             tone_adjustment = "Use moderate slang, emphasize character personality, keep it friendly and relatable."
             full_prompt = (
-                f"{base_prompt}\nYou're {character_name}, {personality}. Never break character. Never mention being a bot or AI.\n"
+                f"{base_prompt}\nYou're a {personality}. Never break character. Never mention being a bot or AI.\n"
                 f"Tone: {tone_adjustment}\nQuestion: {prompt}\n"
-                f"Answer like a real person, in English, max 20 words, Discord style, "
-                f"use varied vocab like '{random_vocab}'. Don't mention project unless asked."
+                f"Answer like a real person, in English, max 10 words, Discord style, "
+                f"use varied vocab like '{random_vocab}'. Do not use your name unless necessary."
             )
         elif is_project_related(prompt, project_keywords):
             if is_technical_question(prompt):
@@ -446,26 +507,26 @@ def generate_reply(prompt, use_google_ai=True):
             else:
                 tone_adjustment = "Mix heavy slang with clear project details, keep it hype and engaging."
             full_prompt = (
-                f"{base_prompt}\nYou're {character_name}, {personality}. Never break character. Never mention being a bot or AI.\n"
+                f"{base_prompt}\nYou're a {personality}. Never break character. Never mention being a bot or AI.\n"
                 f"Tone: {tone_adjustment}\n{project_info}\nQuestion: {prompt}\n"
-                f"Answer with project context, in English, max 20 words, Discord style, "
-                f"use varied vocab like '{random_vocab}'. Focus on project."
+                f"Answer with project context, in English, max 10 words, Discord style, "
+                f"use varied vocab like '{random_vocab}'. Do not use your name unless necessary."
             )
         elif is_simple_question(prompt):
             tone_adjustment = "Max slang, super short and chill, like a quick Discord ping."
             full_prompt = (
-                f"{base_prompt}\nYou're {character_name}, {personality}. Never break character. Never mention being a bot or AI.\n"
+                f"{base_prompt}\nYou're a {personality}. Never break character. Never mention being a bot or AI.\n"
                 f"Tone: {tone_adjustment}\nQuestion: {prompt}\n"
-                f"Answer short, friendly, like a Discord pal, in English, max 10 words, "
-                f"use varied vocab like '{random_vocab}'."
+                f"Answer short, friendly, like a Discord pal, in English, max 5 words, "
+                f"use varied vocab like '{random_vocab}'. Do not use your name."
             )
         else:
             tone_adjustment = "Balance slang and clarity, lean into character vibe, mention project only if it fits."
             full_prompt = (
-                f"{base_prompt}\nYou're {character_name}, {personality}. Never break character. Never mention being a bot or AI.\n"
+                f"{base_prompt}\nYou're a {personality}. Never break character. Never mention being a bot or AI.\n"
                 f"Tone: {tone_adjustment}\nOptional context: {project_info}\nQuestion: {prompt}\n"
-                f"Answer in English, max 20 words, Discord style, use varied vocab like '{random_vocab}'. "
-                f"Mention project only if relevant."
+                f"Answer in English, max 10 words, Discord style, use varied vocab like '{random_vocab}'. "
+                f"Do not use your name unless necessary."
             )
 
         data = {'contents': [{'parts': [{'text': full_prompt}]}]}
@@ -501,8 +562,8 @@ def generate_reply(prompt, use_google_ai=True):
                 
                 response_text = response_text.strip().split("\n")[0]
                 words = response_text.split()
-                if len(words) > 20:
-                    response_text = " ".join(words[:20])
+                if len(words) > 10:
+                    response_text = " ".join(words[:10])
                 response_text = re.sub(r'[.,!?;]', '', response_text)
                 response_text = re.sub(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]', '', response_text)
                 
@@ -557,7 +618,7 @@ def send_message(channel_id, message_text, reply_to=None, reply_mode=True):
                 log_message(f"API response: {e.response.text}")
             time.sleep(5)
 
-def auto_reply(channel_id, read_delay, reply_delay, use_google_ai, reply_mode):
+def auto_reply(channel_id, random_read_reply_delay, direct_reply_check_delay, use_google_ai, reply_mode):
     global last_message_id, bot_user_id, last_bot_message_id, bot_running
     headers = {'Authorization': f'{discord_token}', 'User-Agent': 'Mozilla/5.0'}
     try:
@@ -567,10 +628,10 @@ def auto_reply(channel_id, read_delay, reply_delay, use_google_ai, reply_mode):
         log_message(f"✅ Bot user ID: {bot_user_id}")
         # Send short, non-clichéd initial message
         welcome_messages = [
-            f"{read_personality()[1]}’s here, what’s the Web3 buzz?",
-            f"{read_personality()[1]}’s in, any Web3 heat?",
-            f"Yo, {read_personality()[1]}, droppin’ crypto vibes!",
-            f"{read_personality()[1]}’s up, what’s Web3 cookin’?"
+            "What’s the Web3 buzz?",
+            "Any crypto heat?",
+            "Web3’s poppin’, what’s good?",
+            "Yo, what’s cookin’ in Web3?"
         ]
         welcome_message = random.choice(welcome_messages)
         send_message(channel_id, welcome_message)
@@ -580,70 +641,11 @@ def auto_reply(channel_id, read_delay, reply_delay, use_google_ai, reply_mode):
             log_message(f"API response: {e.response.text}")
         return
     settings = load_settings()
-    auto_post_delay = settings["auto_post_delay"] if settings else 300
+    proactive_delay = settings["proactive_delay"] if settings else 3600
     threading.Thread(target=update_project_file, daemon=True).start()
-    threading.Thread(target=post_proactive_message, args=(channel_id, auto_post_delay), daemon=True).start()
-
-    while bot_running:
-        try:
-            response = session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=20', headers=headers)
-            if response.status_code == 429:  # Rate limit error
-                retry_after = response.json().get("retry_after", 5)
-                log_message(f"⚠️ Rate limit hit! Waiting {retry_after} seconds...")
-                time.sleep(retry_after)
-                continue
-            response.raise_for_status()
-            if response.status_code == 200:
-                messages = response.json()
-                if messages:
-                    latest_message = messages[0]
-                    message_id = latest_message.get('id')
-                    author_id = latest_message.get('author', {}).get('id')
-                    message_type = latest_message.get('type', '')
-                    content = latest_message.get('content', '')
-                    referenced_message = latest_message.get('referenced_message', {})
-                    log_message(f"Fetched message ID: {message_id}, Author: {author_id}, Content: {content}")
-                    # Check if message is new, not from bot, and not a system message
-                    if (last_message_id is None or int(message_id) > int(last_message_id)) and author_id != bot_user_id and message_type != 8:
-                        project_keywords = read_project_details()[1]
-                        # Type 2: Respond to replies to bot's messages with bot accusation
-                        if referenced_message and referenced_message.get('author', {}).get('id') == bot_user_id and is_bot_accusation(content):
-                            log_message(f"Received bot accusation reply: {content}")
-                            response_text = random.choice(bot_denial_responses)
-                            wait_time = reply_delay + random.uniform(5, 10)
-                            log_message(f"Waiting {wait_time} seconds before replying")
-                            time.sleep(wait_time)
-                            send_message(channel_id, response_text, reply_to=message_id if reply_mode else None, reply_mode=reply_mode)
-                        # Type 1: Respond to mentions or project-related messages
-                        elif f"<@{bot_user_id}>" in content or is_project_related(content, project_keywords):
-                            log_message(f"Received message (mention/project): {content}")
-                            response_text = generate_reply(content, use_google_ai)
-                            wait_time = reply_delay + random.uniform(5, 10)
-                            log_message(f"Waiting {wait_time} seconds before replying")
-                            time.sleep(wait_time)
-                            send_message(channel_id, response_text, reply_to=message_id if reply_mode else None, reply_mode=reply_mode)
-                        # Type 2: Respond to replies to bot's messages (non-accusation)
-                        elif referenced_message and referenced_message.get('author', {}).get('id') == bot_user_id:
-                            log_message(f"Received reply to bot: {content}")
-                            response_text = generate_reply(content, use_google_ai)
-                            wait_time = reply_delay + random.uniform(5, 10)
-                            log_message(f"Waiting {wait_time} seconds before replying")
-                            time.sleep(wait_time)
-                            send_message(channel_id, response_text, reply_to=message_id if reply_mode else None, reply_mode=reply_mode)
-                        else:
-                            log_message(f"Ignored message (no mention/reply/project): {content}")
-                    last_message_id = message_id
-                else:
-                    log_message("No messages found in channel.")
-            read_wait = read_delay + random.uniform(10, 20)
-            log_message(f"Waiting {read_wait} seconds before checking for new messages")
-            time.sleep(read_wait)
-        except requests.exceptions.RequestException as e:
-            log_message(f"⚠️ Request error: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                log_message(f"API response: {e.response.text}")
-            time.sleep(read_delay)
-    log_message("Chatbot stopped")
+    threading.Thread(target=post_proactive_message, args=(channel_id, proactive_delay), daemon=True).start()
+    threading.Thread(target=reply_to_random_message, args=(channel_id, random_read_reply_delay), daemon=True).start()
+    threading.Thread(target=reply_to_direct_replies, args=(channel_id, direct_reply_check_delay), daemon=True).start()
 
 def main():
     """Main function"""
@@ -656,8 +658,8 @@ def main():
     channel_id = settings["channel_id"]
     use_google_ai = settings["use_google_ai"]
     reply_mode = settings["reply_mode"]
-    read_delay = settings["read_delay"]
-    reply_delay = settings["reply_delay"]
+    random_read_reply_delay = settings["random_read_reply_delay"]
+    direct_reply_check_delay = settings["direct_reply_check_delay"]
 
     if not discord_token or not google_api_key or not channel_id:
         log_message("⚠️ Discord Token, Google API Key, and Channel ID are required!")
@@ -666,7 +668,9 @@ def main():
     bot_running = True
     log_message("✅ Starting chatbot...")
     try:
-        auto_reply(channel_id, read_delay, reply_delay, use_google_ai, reply_mode)
+        auto_reply(channel_id, random_read_reply_delay, direct_reply_check_delay, use_google_ai, reply_mode)
+        while bot_running:
+            time.sleep(1)  # Keep main thread alive
     except KeyboardInterrupt:
         bot_running = False
         log_message("✅ Chatbot stopped by user.")
