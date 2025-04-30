@@ -57,6 +57,11 @@ def load_settings():
                 settings["google_api_key"] = cipher.decrypt(base64.b64decode(settings["google_api_key"])).decode()
         except Exception as e:
             log_message(f"⚠️ Decryption error for tokens: {e}")
+            try:
+                os.rename(SETTINGS_FILE, f"{SETTINGS_FILE}.bak")
+                log_message(f"⚠️ Renamed corrupted settings file to {SETTINGS_FILE}.bak")
+            except Exception as rename_e:
+                log_message(f"⚠️ Error renaming settings file: {rename_e}")
             return None
         discord_token = settings.get("discord_token")
         google_api_key = settings.get("google_api_key")
@@ -219,7 +224,8 @@ def send_message(channel_id, message_text, reply_to=None, reply_mode=True):
             remaining, reset_after = get_rate_limit_info(response)
             if response.status_code == 429:
                 retry_after = response.json().get("retry_after", reset_after)
-                log_message(f"⚠️ Rate limit hit! Waiting {retry_after} seconds...")
+                log_message(f"⚠️ Rate limit hit! Queuing message: {message_text}")
+                message_queue.put((channel_id, message_text, reply_to, reply_mode))
                 time.sleep(retry_after + 1)
                 continue
             response.raise_for_status()
@@ -234,6 +240,14 @@ def send_message(channel_id, message_text, reply_to=None, reply_mode=True):
             if hasattr(e, 'response') and e.response is not None:
                 log_message(f"API response: {e.response.text}")
             time.sleep(5)
+
+def process_message_queue():
+    """Process queued messages to handle rate limits"""
+    while bot_running:
+        if not message_queue.empty():
+            channel_id, message_text, reply_to, reply_mode = message_queue.get()
+            send_message(channel_id, message_text, reply_to, reply_mode)
+        time.sleep(1)
 
 def read_personality():
     """Read personality and character name from settings"""
@@ -534,10 +548,10 @@ def generate_reply(prompt, use_google_ai=True):
         f"Man, I’m {character_name}, no bot nonsense!",
         f"Chill, {character_name}’s no bot, you wild!",
         f"No way, I’m {character_name}, you slippin’!",
-        f"Fam, {character_name}’s legit, you buggin’!",
+        f"Fam, I’m {character_name}’s legit, you buggin’!",
         f"Get real, I’m {character_name}, you tweakin’!",
         f"Ha, I’m {character_name}, no bot, bruh!",
-        f"Nope, {character_name}’s real, you wildin’!",
+        f"Nope, I’m {character_name}, you wildin’!",
         f"Bruh, I’m {character_name}, you cappin’!",
         f"Yo, {character_name}’s no bot, relax!"
     ]
@@ -663,6 +677,7 @@ def auto_reply(channel_id, random_read_reply_delay, direct_reply_check_delay, us
     settings = load_settings()
     proactive_delay = settings["proactive_delay"] if settings else 3600
     threading.Thread(target=update_project_file, daemon=True).start()
+    threading.Thread(target=process_message_queue, daemon=True).start()
     threading.Thread(target=post_proactive_message, args=(channel_id, proactive_delay), daemon=True).start()
     threading.Thread(target=reply_to_random_message, args=(channel_id, random_read_reply_delay, reply_mode), daemon=True).start()
     threading.Thread(target=reply_to_direct_replies, args=(channel_id, direct_reply_check_delay, reply_mode), daemon=True).start()
