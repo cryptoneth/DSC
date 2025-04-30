@@ -31,7 +31,7 @@ def log_message(message):
     print(f"{timestamp} - {message}")
 
 def load_settings():
-    """Load settings from settings.json, return None if incomplete"""
+    """Load settings from settings.json, return None if incomplete or error"""
     global discord_token, google_api_key
     try:
         if not os.path.exists(SETTINGS_FILE):
@@ -40,10 +40,14 @@ def load_settings():
         with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
             settings = json.load(f)
         # Decrypt tokens
-        if settings.get("discord_token"):
-            settings["discord_token"] = cipher.decrypt(base64.b64decode(settings["discord_token"])).decode()
-        if settings.get("google_api_key"):
-            settings["google_api_key"] = cipher.decrypt(base64.b64decode(settings["google_api_key"])).decode()
+        try:
+            if settings.get("discord_token"):
+                settings["discord_token"] = cipher.decrypt(base64.b64decode(settings["discord_token"])).decode()
+            if settings.get("google_api_key"):
+                settings["google_api_key"] = cipher.decrypt(base64.b64decode(settings["google_api_key"])).decode()
+        except Exception as e:
+            log_message(f"⚠️ Decryption error for tokens: {e}")
+            return None
         discord_token = settings.get("discord_token")
         google_api_key = settings.get("google_api_key")
         # Validate required fields
@@ -54,30 +58,63 @@ def load_settings():
         ]
         if all(field in settings for field in required_fields):
             if all(key in settings["project_details"] for key in ["name", "description", "key_features"]):
+                log_message("✅ Settings loaded successfully.")
                 return settings
-        log_message("⚠️ Incomplete settings in file, treating as missing.")
+        log_message("⚠️ Incomplete settings in file, missing required fields.")
+        return None
+    except json.JSONDecodeError as e:
+        log_message(f"⚠️ JSON decode error in settings file: {e}")
         return None
     except Exception as e:
         log_message(f"⚠️ Error loading settings: {e}")
         return None
 
 def save_settings(settings):
-    """Save settings to settings.json"""
+    """Save settings to settings.json with validation and error handling"""
     global discord_token, google_api_key
     try:
+        # Validate required fields before saving
+        required_fields = [
+            "tone", "character_name", "personality", "project_details", "project_keywords",
+            "discord_token", "google_api_key", "channel_id", "use_google_ai", "reply_mode",
+            "read_delay", "reply_delay", "auto_post_delay"
+        ]
+        if not all(field in settings for field in required_fields):
+            log_message("⚠️ Cannot save settings: Missing required fields.")
+            return False
+        if not all(key in settings["project_details"] for key in ["name", "description", "key_features"]):
+            log_message("⚠️ Cannot save settings: Missing project details fields.")
+            return False
         save_data = settings.copy()
         # Encrypt tokens
-        if save_data.get("discord_token"):
-            save_data["discord_token"] = base64.b64encode(cipher.encrypt(save_data["discord_token"].encode())).decode()
-        if save_data.get("google_api_key"):
-            save_data["google_api_key"] = base64.b64encode(cipher.encrypt(save_data["google_api_key"].encode())).decode()
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(save_data, f, ensure_ascii=False, indent=4)
-        discord_token = settings.get("discord_token")
-        google_api_key = settings.get("google_api_key")
-        log_message("✅ Settings saved successfully.")
+        try:
+            if save_data.get("discord_token"):
+                save_data["discord_token"] = base64.b64encode(cipher.encrypt(save_data["discord_token"].encode())).decode()
+            if save_data.get("google_api_key"):
+                save_data["google_api_key"] = base64.b64encode(cipher.encrypt(save_data["google_api_key"].encode())).decode()
+        except Exception as e:
+            log_message(f"⚠️ Encryption error for tokens: {e}")
+            return False
+        # Try saving with retries
+        for attempt in range(3):
+            try:
+                with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(save_data, f, ensure_ascii=False, indent=4)
+                discord_token = settings.get("discord_token")
+                google_api_key = settings.get("google_api_key")
+                log_message("✅ Settings saved successfully.")
+                return True
+            except PermissionError as e:
+                log_message(f"⚠️ Permission error saving settings (attempt {attempt+1}/3): {e}")
+                time.sleep(1)
+            except Exception as e:
+                log_message(f"⚠️ Error saving settings (attempt {attempt+1}/3): {e}")
+                time.sleep(1)
+        log_message("⚠️ Failed to save settings after retries.")
+        return False
     except Exception as e:
-        log_message(f"⚠️ Error saving settings: {e}")
+        log_message(f"⚠️ Unexpected error saving settings: {e}")
+        return False
 
 def configure_settings():
     """Prompt for settings or load saved ones"""
@@ -108,8 +145,11 @@ def configure_settings():
         "reply_delay": int(input("Enter Reply Delay for responding to messages (seconds): ").strip()),
         "auto_post_delay": int(input("Enter Auto-Post Delay for sending proactive messages (seconds): ").strip())
     }
-    save_settings(settings)
-    return settings
+    if save_settings(settings):
+        return settings
+    else:
+        log_message("⚠️ Failed to save settings, using temporary settings.")
+        return settings
 
 def get_rate_limit_info(response):
     """Check rate limit headers"""
@@ -138,11 +178,17 @@ def send_typing(channel_id):
 def read_personality():
     """Read personality and character name from settings"""
     settings = load_settings()
+    if settings is None:
+        log_message("⚠️ No valid settings, using default personality.")
+        return "Crypto bro", "Crypton"
     return settings["personality"], settings["character_name"]
 
 def read_project_details():
     """Read project details and keywords from settings"""
     settings = load_settings()
+    if settings is None:
+        log_message("⚠️ No valid settings, using default project details.")
+        return {"name": "Unknown", "description": "", "key_features": ""}, ["Web3"]
     project_details = settings["project_details"]
     keywords = settings["project_keywords"].split(", ")
     return project_details, keywords
@@ -174,9 +220,10 @@ def update_project_file():
             response.raise_for_status()
             new_keywords = response.json()['candidates'][0]['content']['parts'][0]['text']
             settings = load_settings()
-            settings["project_keywords"] = new_keywords
-            save_settings(settings)
-            log_message("✅ Project keywords updated successfully.")
+            if settings:
+                settings["project_keywords"] = new_keywords
+                save_settings(settings)
+                log_message("✅ Project keywords updated successfully.")
         except requests.exceptions.RequestException as e:
             log_message(f"⚠️ Failed to update project keywords: {e}")
             if hasattr(e, 'response') and e.response is not None:
@@ -262,12 +309,12 @@ def is_bot_accusation(prompt):
 def generate_reply(prompt, use_google_ai=True):
     global last_ai_response
     settings = load_settings()
-    tone = settings["tone"].lower()
+    tone = settings["tone"].lower() if settings else "Chat like a chill Discord pal, laid-back, friendly, slang-heavy, vibin’ with the crew."
     personality, character_name = read_personality()
     project_details, project_keywords = read_project_details()
 
     # Base tone prompt from user input
-    base_prompt = tone if tone else "Chat like a chill Discord pal, laid-back, friendly, slang-heavy, vibin’ with the crew."
+    base_prompt = tone
 
     # Expanded vocabulary for natural, varied responses
     vocab_variations = [
@@ -346,17 +393,6 @@ def generate_reply(prompt, use_google_ai=True):
         f"Yo, {character_name}’s no bot, you good?",
         f"Ayy, I’m {character_name}, you trippin’!",
         f"Pfft, {character_name}’s real, you cappin’!",
-        f"Man, I’m {character_name}, no bot nonsense!",
-        f"Chill, {character_name}’s no bot, you wild!",
-        f"No way, I’m {character_name}, you slippin’!",
-        f"Fam, {character_name}’s legit, you buggin’!",
-        f"Get real, I’m {character_name}, you tweakin’!",
-        f"Ha, I’m {character_name}, no bot, bruh!",
-        f"Nope, {character_name}’s real, you wildin’!",
-        f"Bruh, I’m {character_name}, you cappin’!",
-        f"Yo, {character_name}’s no bot, relax!",
-        f"Ayy, I’m {character_name}, you wildin’!",
-        f"Pfft, {character_name}’s real, you buggin’!",
         f"Man, I’m {character_name}, no bot nonsense!",
         f"Chill, {character_name}’s no bot, you wild!",
         f"No way, I’m {character_name}, you slippin’!",
@@ -508,8 +544,8 @@ def auto_reply(channel_id, read_delay, reply_delay, use_google_ai, reply_mode):
         bot_info_response.raise_for_status()
         bot_user_id = bot_info_response.json().get('id')
         log_message(f"✅ Bot user ID: {bot_user_id}")
-        # Send initial welcome message
-        welcome_message = f"Yo, {read_personality()[1]} here, ready to vibe in Web3! Ping me with @{read_personality()[1]} to chat!"
+        # Send short, non-clichéd initial message
+        welcome_message = f"{read_personality()[1]}’s here, what’s the Web3 buzz?"
         send_message(channel_id, welcome_message)
     except requests.exceptions.RequestException as e:
         log_message(f"⚠️ Failed to retrieve bot information: {e}")
@@ -517,7 +553,7 @@ def auto_reply(channel_id, read_delay, reply_delay, use_google_ai, reply_mode):
             log_message(f"API response: {e.response.text}")
         return
     settings = load_settings()
-    auto_post_delay = settings["auto_post_delay"]
+    auto_post_delay = settings["auto_post_delay"] if settings else 300
     threading.Thread(target=update_project_file, daemon=True).start()
     threading.Thread(target=post_proactive_message, args=(channel_id, auto_post_delay), daemon=True).start()
 
