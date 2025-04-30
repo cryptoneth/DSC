@@ -31,17 +31,12 @@ def log_message(message):
     print(f"{timestamp} - {message}")
 
 def load_settings():
-    """Load settings from settings.json (only for tokens, no defaults for other fields)"""
+    """Load settings from settings.json, return None if incomplete"""
     global discord_token, google_api_key
-    default_settings = {
-        "discord_token": "",
-        "google_api_key": "",
-        "channel_id": ""
-    }
     try:
         if not os.path.exists(SETTINGS_FILE):
-            log_message("⚠️ Settings file not found, starting fresh.")
-            return default_settings
+            log_message("⚠️ Settings file not found.")
+            return None
         with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
             settings = json.load(f)
         # Decrypt tokens
@@ -51,10 +46,20 @@ def load_settings():
             settings["google_api_key"] = cipher.decrypt(base64.b64decode(settings["google_api_key"])).decode()
         discord_token = settings.get("discord_token")
         google_api_key = settings.get("google_api_key")
-        return settings
+        # Validate required fields
+        required_fields = [
+            "tone", "character_name", "personality", "project_details", "project_keywords",
+            "discord_token", "google_api_key", "channel_id", "use_google_ai", "reply_mode",
+            "read_delay", "reply_delay"
+        ]
+        if all(field in settings for field in required_fields):
+            if all(key in settings["project_details"] for key in ["name", "description", "key_features"]):
+                return settings
+        log_message("⚠️ Incomplete settings in file, treating as missing.")
+        return None
     except Exception as e:
         log_message(f"⚠️ Error loading settings: {e}")
-        return default_settings
+        return None
 
 def save_settings(settings):
     """Save settings to settings.json"""
@@ -75,14 +80,21 @@ def save_settings(settings):
         log_message(f"⚠️ Error saving settings: {e}")
 
 def configure_settings():
-    """Prompt for all settings at startup"""
-    print("⚙️ Configuring settings...")
+    """Prompt for settings or load saved ones"""
+    saved_settings = load_settings()
+    if saved_settings:
+        print("⚙️ Found saved settings in settings.json.")
+        choice = input("Do you want to use saved settings or enter new ones? (saved/new): ").strip().lower()
+        if choice == "saved":
+            log_message("✅ Using saved settings.")
+            return saved_settings
+    print("⚙️ Configuring new settings...")
     settings = {
-        "tone": input("Enter tone (e.g., casual, professional, sarcastic, enthusiastic): ").strip(),
-        "character_name": input("Enter character name (e.g., Krypton): ").strip(),
-        "personality": input("Enter personality (e.g., A crypto bro hyped about DeFi): ").strip(),
+        "tone": input("Enter tone (e.g., Balanced Discord slang with smooth conversational flow, dynamically adapt tone to topic and message, professional and clear when needed, always human-like, direct, relatable): ").strip(),
+        "character_name": input("Enter character name (e.g., Crypton): ").strip(),
+        "personality": input("Enter personality (e.g., Crypto researcher with 7 years experience, part-time trader, programmer, runs Telegram/Twitter with 15k followers, joins promising Web3 projects, loves crypto): ").strip(),
         "project_details": {
-            "name": input("Enter project name (e.g., Altius): ").strip(),
+            "name": input("Enter project name (e.g., Altius Labs): ").strip(),
             "description": input("Enter project description: ").strip(),
             "key_features": input("Enter key features (comma-separated): ").strip()
         },
@@ -138,25 +150,37 @@ def update_project_file():
     """Automatically update project keywords every 24 hours"""
     while True:
         try:
-            url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={google_api_key}'
-            headers = {'Content-Type': 'application/json'}
             project_details, _ = read_project_details()
+            if not project_details.get('name') or not project_details.get('description'):
+                log_message("⚠️ Project name or description missing, skipping keyword update.")
+                time.sleep(24 * 60 * 60)
+                continue
+            prompt_text = f"Current project: {project_details['name']} - {project_details['description']}\nSuggest updated keywords for this project. Keep it short, casual, in English."
             data = {
                 'contents': [{
-                    'parts': [{
-                        'text': f"Current project: {project_details['name']} - {project_details['description']}\nSuggest updated keywords for this project. Keep it short, casual, in English."
-                    }]
+                    'parts': [{'text': prompt_text}]
                 }]
             }
+            log_message(f"API request payload: {json.dumps(data, indent=2)}")
+            url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={google_api_key}'
+            headers = {'Content-Type': 'application/json'}
             response = session.post(url, headers=headers, json=data)
+            if response.status_code == 429:  # Rate limit error
+                retry_after = response.json().get("retry_after", 60)
+                log_message(f"⚠️ Rate limit hit! Waiting {retry_after} seconds...")
+                time.sleep(retry_after)
+                continue
             response.raise_for_status()
             new_keywords = response.json()['candidates'][0]['content']['parts'][0]['text']
             settings = load_settings()
             settings["project_keywords"] = new_keywords
             save_settings(settings)
             log_message("✅ Project keywords updated successfully.")
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             log_message(f"⚠️ Failed to update project keywords: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                log_message(f"API response: {e.response.text}")
+            log_message("⚠️ Skipping keyword update, will retry in 24 hours.")
         time.sleep(24 * 60 * 60)
 
 def is_personal_question(prompt):
@@ -198,6 +222,14 @@ def is_comprehensible(message):
     cleaned = emoji_pattern.sub(r'', message).strip()
     return len(cleaned) > 5
 
+def is_technical_question(prompt):
+    """Detect technical questions requiring professional tone"""
+    technical_keywords = [
+        "how does", "explain", "what is", "mechanism", "process", "function",
+        "technical", "details", "work", "system", "technology"
+    ]
+    return any(keyword.lower() in prompt.lower() for keyword in technical_keywords)
+
 def generate_reply(prompt, use_google_ai=True):
     global last_ai_response
     settings = load_settings()
@@ -205,16 +237,8 @@ def generate_reply(prompt, use_google_ai=True):
     personality, character_name = read_personality()
     project_details, project_keywords = read_project_details()
 
-    # Define tone-specific prompt styles with emphasis on character adherence
-    tone_prompts = {
-        "casual": "Chat like a chill Discord pal, laid-back, friendly, slang-heavy, vibin’ with the crew. Stay in character.",
-        "professional": "Reply like a sharp Discord pro, clear, polished, approachable, no stiff vibes. Stay in character.",
-        "sarcastic": "Answer with snarky wit, tossin’ shade in Discord, keep it fun, not mean. Stay in character.",
-        "enthusiastic": "Go wild with hype, AMPED in Discord, burstin’ with energy, make it pop! Stay in character."
-    }
-
-    base_prompt = tone_prompts.get(tone, tone_prompts["casual"])
-    project_info = f"Project: {project_details['name']} - {project_details['description']} (Features: {project_details['key_features']})"
+    # Base tone prompt from user input
+    base_prompt = tone if tone else "Chat like a chill Discord pal, laid-back, friendly, slang-heavy, vibin’ with the crew."
 
     # Expanded vocabulary for natural, varied responses
     vocab_variations = [
@@ -225,35 +249,45 @@ def generate_reply(prompt, use_google_ai=True):
     ]
     random_vocab = random.choice(vocab_variations)
 
+    project_info = f"Project: {project_details['name']} - {project_details['description']} (Features: {project_details['key_features']})"
+
     if use_google_ai:
-        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={google_api_key}'
+        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={google_api_key}'
         headers = {'Content-Type': 'application/json'}
         
+        # Dynamic tone adjustments based on message type and content
         if is_personal_question(prompt):
+            tone_adjustment = "Use moderate slang, emphasize character personality, keep it friendly and relatable."
             full_prompt = (
                 f"{base_prompt}\nYou're {character_name}, {personality}. Never break character. Never mention being a bot or AI.\n"
-                f"Question: {prompt}\n"
+                f"Tone: {tone_adjustment}\nQuestion: {prompt}\n"
                 f"Answer like a real person, in English, max 20 words, Discord style, "
                 f"use varied vocab like '{random_vocab}'. Don't mention project unless asked."
             )
         elif is_project_related(prompt, project_keywords):
+            if is_technical_question(prompt):
+                tone_adjustment = "Lean professional, clear, and direct with minimal slang, but keep it approachable."
+            else:
+                tone_adjustment = "Mix heavy slang with clear project details, keep it hype and engaging."
             full_prompt = (
                 f"{base_prompt}\nYou're {character_name}, {personality}. Never break character. Never mention being a bot or AI.\n"
-                f"{project_info}\nQuestion: {prompt}\n"
+                f"Tone: {tone_adjustment}\n{project_info}\nQuestion: {prompt}\n"
                 f"Answer with project context, in English, max 20 words, Discord style, "
                 f"use varied vocab like '{random_vocab}'. Focus on project."
             )
         elif is_simple_question(prompt):
+            tone_adjustment = "Max slang, super short and chill, like a quick Discord ping."
             full_prompt = (
                 f"{base_prompt}\nYou're {character_name}, {personality}. Never break character. Never mention being a bot or AI.\n"
-                f"Question: {prompt}\n"
+                f"Tone: {tone_adjustment}\nQuestion: {prompt}\n"
                 f"Answer short, friendly, like a Discord pal, in English, max 10 words, "
                 f"use varied vocab like '{random_vocab}'."
             )
         else:
+            tone_adjustment = "Balance slang and clarity, lean into character vibe, mention project only if it fits."
             full_prompt = (
                 f"{base_prompt}\nYou're {character_name}, {personality}. Never break character. Never mention being a bot or AI.\n"
-                f"Optional context: {project_info}\nQuestion: {prompt}\n"
+                f"Tone: {tone_adjustment}\nOptional context: {project_info}\nQuestion: {prompt}\n"
                 f"Answer in English, max 20 words, Discord style, use varied vocab like '{random_vocab}'. "
                 f"Mention project only if relevant."
             )
@@ -264,21 +298,23 @@ def generate_reply(prompt, use_google_ai=True):
         for attempt in range(3):
             try:
                 response = session.post(url, headers=headers, json=data)
+                if response.status_code == 429:  # Rate limit error
+                    retry_after = response.json().get("retry_after", 60)
+                    log_message(f"⚠️ Rate limit hit! Waiting {retry_after} seconds...")
+                    time.sleep(retry_after)
+                    continue
                 response.raise_for_status()
                 ai_response = response.json()
                 response_text = ai_response['candidates'][0]['content']['parts'][0]['text']
                 
                 # Refined blocked words to avoid AI giveaways only
                 blocked_words = [
-                    # Direct AI/bot references
                     "I am a bot", "I’m a bot", "as an AI", "as a bot", "language model",
                     "artificial intelligence", "AI model", "chatbot", "digital assistant",
                     "I’m programmed", "programmed to", "my creators", "designed to",
                     "I am an AI", "I’m an AI", "machine learning model",
-                    # Technical terms
                     "algorithm", "neural network", "processing", "compute", "data analysis",
                     "query processing", "natural language processing", "system response",
-                    # Generic AI responses
                     "I don’t have personal experiences", "I don’t have feelings",
                     "I’m not human", "as a machine", "I’m a program", "I’m software",
                     "I’m a digital entity", "I’m a virtual assistant", "I’m built to",
@@ -303,7 +339,9 @@ def generate_reply(prompt, use_google_ai=True):
                 last_ai_response = response_text
                 return response_text
             except requests.exceptions.RequestException as e:
-                log_message(f"AI request failed: {e}")
+                log_message(f"⚠️ AI request failed: {e}")
+                if hasattr(e, 'response') and e.response is not None:
+                    log_message(f"API response: {e.response.text}")
                 return f"Whoops {random_vocab} something broke try again later"
     return f"Can't chat now {random_vocab} catch ya later"
 
