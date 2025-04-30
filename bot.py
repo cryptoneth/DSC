@@ -50,7 +50,7 @@ def load_settings():
         required_fields = [
             "tone", "character_name", "personality", "project_details", "project_keywords",
             "discord_token", "google_api_key", "channel_id", "use_google_ai", "reply_mode",
-            "read_delay", "reply_delay"
+            "read_delay", "reply_delay", "auto_post_delay"
         ]
         if all(field in settings for field in required_fields):
             if all(key in settings["project_details"] for key in ["name", "description", "key_features"]):
@@ -104,8 +104,9 @@ def configure_settings():
         "channel_id": input("Enter Discord Channel ID: ").strip(),
         "use_google_ai": input("Use Google Gemini AI? (yes/no): ").strip().lower() == "yes",
         "reply_mode": input("Enable Reply Mode? (yes/no): ").strip().lower() == "yes",
-        "read_delay": int(input("Enter Read Delay (seconds): ").strip()),
-        "reply_delay": int(input("Enter Reply Delay (seconds): ").strip())
+        "read_delay": int(input("Enter Read Delay for checking new messages (seconds): ").strip()),
+        "reply_delay": int(input("Enter Reply Delay for responding to messages (seconds): ").strip()),
+        "auto_post_delay": int(input("Enter Auto-Post Delay for sending proactive messages (seconds): ").strip())
     }
     save_settings(settings)
     return settings
@@ -183,6 +184,41 @@ def update_project_file():
             log_message("⚠️ Skipping keyword update, will retry in 24 hours.")
         time.sleep(24 * 60 * 60)
 
+def post_proactive_message(channel_id, delay):
+    """Post proactive messages at specified interval based on recent messages"""
+    while bot_running:
+        try:
+            # Fetch recent messages for context (up to 20)
+            headers = {'Authorization': f'{discord_token}', 'User-Agent': 'Mozilla/5.0'}
+            response = session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=20', headers=headers)
+            response.raise_for_status()
+            messages = response.json()
+            context = " ".join([msg.get('content', '') for msg in messages if msg.get('content')])
+            project_details, project_keywords = read_project_details()
+            personality, character_name = read_personality()
+            prompt = (
+                f"You're {character_name}, {personality}. Recent chat: {context[:500]}.\n"
+                f"Project: {project_details['name']} - {project_details['description']}.\n"
+                f"Generate a short, casual message (max 20 words) to join the conversation, "
+                f"using Discord slang, relevant to the chat or project, in English."
+            )
+            data = {
+                'contents': [{
+                    'parts': [{'text': prompt}]
+                }]
+            }
+            url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={google_api_key}'
+            response = session.post(url, headers={'Content-Type': 'application/json'}, json=data)
+            response.raise_for_status()
+            message_text = response.json()['candidates'][0]['content']['parts'][0]['text']
+            send_message(channel_id, message_text)
+            log_message(f"✅ Posted proactive message: {message_text}")
+        except requests.exceptions.RequestException as e:
+            log_message(f"⚠️ Failed to post proactive message: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                log_message(f"API response: {e.response.text}")
+        time.sleep(delay)
+
 def is_personal_question(prompt):
     """Detect personal questions"""
     personal_keywords = [
@@ -207,21 +243,6 @@ def is_simple_question(prompt):
     ]
     return len(prompt.split()) <= 3 or any(keyword.lower() in prompt.lower() for keyword in simple_keywords)
 
-def is_comprehensible(message):
-    """Check if message is comprehensible"""
-    if not message:
-        return False
-    emoji_pattern = re.compile(
-        "["
-        u"\U0001F600-\U0001F64F"
-        u"\U0001F300-\U0001F5FF"
-        u"\U0001F680-\U0001F6FF"
-        u"\U0001F1E0-\U0001F1FF"
-        "]+", flags=re.UNICODE
-    )
-    cleaned = emoji_pattern.sub(r'', message).strip()
-    return len(cleaned) > 5
-
 def is_technical_question(prompt):
     """Detect technical questions requiring professional tone"""
     technical_keywords = [
@@ -229,6 +250,14 @@ def is_technical_question(prompt):
         "technical", "details", "work", "system", "technology"
     ]
     return any(keyword.lower() in prompt.lower() for keyword in technical_keywords)
+
+def is_bot_accusation(prompt):
+    """Detect if message accuses the bot of being a bot"""
+    bot_keywords = [
+        "bot", "robot", "AI", "artificial intelligence", "chatbot", "automated",
+        "are you a bot", "you're a bot", "is this a bot", "bot or human"
+    ]
+    return any(keyword.lower() in prompt.lower() for keyword in bot_keywords)
 
 def generate_reply(prompt, use_google_ai=True):
     global last_ai_response
@@ -248,6 +277,96 @@ def generate_reply(prompt, use_google_ai=True):
         "ayy", "fam", "tight", "clutch", "banger", "vibe check", "slaps"
     ]
     random_vocab = random.choice(vocab_variations)
+
+    # 100 varied denial responses for bot accusations
+    bot_denial_responses = [
+        f"Nah, I’m {character_name}, you trippin’ bruh!",
+        f"Bruh, {character_name}’s real, chill out!",
+        f"Yo, no bot here, just {character_name}!",
+        f"Ayy, {character_name} ain’t no bot, fam!",
+        f"Pfft, you think {character_name}’s a bot? Wild!",
+        f"Man, I’m {character_name}, you buggin’!",
+        f"Chill, {character_name}’s legit, no cap!",
+        f"No way, {character_name}’s real, you cappin’!",
+        f"What?! I’m {character_name}, not a bot!",
+        f"Fam, {character_name} ain’t robotic, relax!",
+        f"Get real, I’m {character_name}, you tweakin’!",
+        f"Ha, {character_name}’s no bot, you clownin’!",
+        f"Nope, just {character_name}, you wildin’!",
+        f"Bruh, I’m {character_name}, no bot vibes!",
+        f"Yo, {character_name}’s the man, you buggin’!",
+        f"Ayy, no bot, I’m {character_name}, chill!",
+        f"Pfft, {character_name}’s real, you trippin’!",
+        f"Man, {character_name} ain’t no bot, bruh!",
+        f"Chill out, I’m {character_name}, you cappin’!",
+        f"No bot, fam, just {character_name}, relax!",
+        f"What, you think {character_name}’s a bot? Nah!",
+        f"Nah, {character_name}’s legit, you slippin’!",
+        f"Bruh, no bot here, I’m {character_name}!",
+        f"Yo, I’m {character_name}, you wildin’ fam!",
+        f"Ayy, {character_name}’s real, stop clownin’!",
+        f"Pfft, I’m {character_name}, no bot nonsense!",
+        f"Man, {character_name}’s vibes, you buggin’!",
+        f"Chill, I’m {character_name}, no bot, bruh!",
+        f"No way, {character_name} ain’t robotic, you good?",
+        f"Fam, I’m {character_name}, you tweakin’!",
+        f"Get it straight, {character_name}’s no bot!",
+        f"Ha, you cappin’? I’m {character_name}, fam!",
+        f"Nope, {character_name}’s real, you trippin’!",
+        f"Bruh, I’m {character_name}, you slippin’!",
+        f"Yo, no bot vibes, just {character_name}!",
+        f"Ayy, {character_name}’s the real deal, chill!",
+        f"Pfft, you wild! I’m {character_name}, not bot!",
+        f"Man, I’m {character_name}, you clownin’ or what?",
+        f"Chill, {character_name}’s legit, you wildin’!",
+        f"No bot here, I’m {character_name}, no cap!",
+        f"What?! {character_name}’s real, you buggin’!",
+        f"Nah, I’m {character_name}, stop playin’!",
+        f"Bruh, {character_name} ain’t no bot, relax!",
+        f"Yo, I’m {character_name}, you cappin’ hard!",
+        f"Ayy, no bot, just {character_name}, you good?",
+        f"Pfft, {character_name}’s no bot, you tweakin’!",
+        f"Man, {character_name}’s real, you trippin’!",
+        f"Chill out, I’m {character_name}, you slippin’!",
+        f"No way, {character_name}’s vibes, you buggin’!",
+        f"Fam, I’m {character_name}, no bot nonsense!",
+        f"Get real, {character_name}’s no bot, bruh!",
+        f"Ha, you wild! {character_name}’s no bot!",
+        f"Nope, I’m {character_name}, you trippin’!",
+        f"Bruh, {character_name}’s real, you buggin’!",
+        f"Yo, I’m {character_name}, no bot vibes!",
+        f"Ayy, no bot, just {character_name}, relax!",
+        f"Pfft, {character_name}’s no bot, you wild!",
+        f"Man, I’m {character_name}, you cappin’!",
+        f"Chill, I’m {character_name}, you slippin’!",
+        f"No bot, {character_name}’s real, you tweakin’!",
+        f"What?! {character_name}’s legit, you buggin’!",
+        f"Nah, I’m {character_name}, you wildin’!",
+        f"Bruh, no bot, I’m {character_name}, fam!",
+        f"Yo, {character_name}’s no bot, you good?",
+        f"Ayy, I’m {character_name}, you trippin’!",
+        f"Pfft, {character_name}’s real, you cappin’!",
+        f"Man, I’m {character_name}, no bot nonsense!",
+        f"Chill, {character_name}’s no bot, you wild!",
+        f"No way, I’m {character_name}, you slippin’!",
+        f"Fam, {character_name}’s legit, you buggin’!",
+        f"Get real, I’m {character_name}, you tweakin’!",
+        f"Ha, I’m {character_name}, no bot, bruh!",
+        f"Nope, {character_name}’s real, you wildin’!",
+        f"Bruh, I’m {character_name}, you cappin’!",
+        f"Yo, {character_name}’s no bot, relax!",
+        f"Ayy, I’m {character_name}, you wildin’!",
+        f"Pfft, {character_name}’s real, you buggin’!",
+        f"Man, I’m {character_name}, no bot nonsense!",
+        f"Chill, {character_name}’s no bot, you wild!",
+        f"No way, I’m {character_name}, you slippin’!",
+        f"Fam, {character_name}’s legit, you buggin’!",
+        f"Get real, I’m {character_name}, you tweakin’!",
+        f"Ha, I’m {character_name}, no bot, bruh!",
+        f"Nope, {character_name}’s real, you wildin’!",
+        f"Bruh, I’m {character_name}, you cappin’!",
+        f"Yo, {character_name}’s no bot, relax!"
+    ]
 
     project_info = f"Project: {project_details['name']} - {project_details['description']} (Features: {project_details['key_features']})"
 
@@ -307,7 +426,7 @@ def generate_reply(prompt, use_google_ai=True):
                 ai_response = response.json()
                 response_text = ai_response['candidates'][0]['content']['parts'][0]['text']
                 
-                # Refined blocked words to avoid AI giveaways only
+                # Refined blocked words to avoid AI giveaways
                 blocked_words = [
                     "I am a bot", "I’m a bot", "as an AI", "as a bot", "language model",
                     "artificial intelligence", "AI model", "chatbot", "digital assistant",
@@ -377,6 +496,8 @@ def send_message(channel_id, message_text, reply_to=None, reply_mode=True):
             break
         except requests.exceptions.RequestException as e:
             log_message(f"⚠️ Request error: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                log_message(f"API response: {e.response.text}")
             time.sleep(5)
 
 def auto_reply(channel_id, read_delay, reply_delay, use_google_ai, reply_mode):
@@ -386,14 +507,28 @@ def auto_reply(channel_id, read_delay, reply_delay, use_google_ai, reply_mode):
         bot_info_response = session.get('https://discord.com/api/v9/users/@me', headers=headers)
         bot_info_response.raise_for_status()
         bot_user_id = bot_info_response.json().get('id')
+        log_message(f"✅ Bot user ID: {bot_user_id}")
+        # Send initial welcome message
+        welcome_message = f"Yo, {read_personality()[1]} here, ready to vibe in Web3! Ping me with @{read_personality()[1]} to chat!"
+        send_message(channel_id, welcome_message)
     except requests.exceptions.RequestException as e:
-        log_message(f"Failed to retrieve bot information: {e}")
+        log_message(f"⚠️ Failed to retrieve bot information: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            log_message(f"API response: {e.response.text}")
         return
+    settings = load_settings()
+    auto_post_delay = settings["auto_post_delay"]
     threading.Thread(target=update_project_file, daemon=True).start()
+    threading.Thread(target=post_proactive_message, args=(channel_id, auto_post_delay), daemon=True).start()
 
     while bot_running:
         try:
-            response = session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=10', headers=headers)
+            response = session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=20', headers=headers)
+            if response.status_code == 429:  # Rate limit error
+                retry_after = response.json().get("retry_after", 5)
+                log_message(f"⚠️ Rate limit hit! Waiting {retry_after} seconds...")
+                time.sleep(retry_after)
+                continue
             response.raise_for_status()
             if response.status_code == 200:
                 messages = response.json()
@@ -402,22 +537,48 @@ def auto_reply(channel_id, read_delay, reply_delay, use_google_ai, reply_mode):
                     message_id = latest_message.get('id')
                     author_id = latest_message.get('author', {}).get('id')
                     message_type = latest_message.get('type', '')
+                    content = latest_message.get('content', '')
                     referenced_message = latest_message.get('referenced_message', {})
+                    log_message(f"Fetched message ID: {message_id}, Author: {author_id}, Content: {content}")
+                    # Check if message is new, not from bot, and not a system message
                     if (last_message_id is None or int(message_id) > int(last_message_id)) and author_id != bot_user_id and message_type != 8:
-                        if referenced_message and referenced_message.get('author', {}).get('id') == bot_user_id:
-                            user_message = latest_message.get('content', '')
-                            log_message(f"Received reply: {user_message}")
-                            response_text = generate_reply(user_message, use_google_ai)
+                        project_keywords = read_project_details()[1]
+                        # Type 2: Respond to replies to bot's messages with bot accusation
+                        if referenced_message and referenced_message.get('author', {}).get('id') == bot_user_id and is_bot_accusation(content):
+                            log_message(f"Received bot accusation reply: {content}")
+                            response_text = random.choice(bot_denial_responses)
                             wait_time = reply_delay + random.uniform(5, 10)
                             log_message(f"Waiting {wait_time} seconds before replying")
                             time.sleep(wait_time)
                             send_message(channel_id, response_text, reply_to=message_id if reply_mode else None, reply_mode=reply_mode)
-                            last_message_id = message_id
+                        # Type 1: Respond to mentions or project-related messages
+                        elif f"<@{bot_user_id}>" in content or is_project_related(content, project_keywords):
+                            log_message(f"Received message (mention/project): {content}")
+                            response_text = generate_reply(content, use_google_ai)
+                            wait_time = reply_delay + random.uniform(5, 10)
+                            log_message(f"Waiting {wait_time} seconds before replying")
+                            time.sleep(wait_time)
+                            send_message(channel_id, response_text, reply_to=message_id if reply_mode else None, reply_mode=reply_mode)
+                        # Type 2: Respond to replies to bot's messages (non-accusation)
+                        elif referenced_message and referenced_message.get('author', {}).get('id') == bot_user_id:
+                            log_message(f"Received reply to bot: {content}")
+                            response_text = generate_reply(content, use_google_ai)
+                            wait_time = reply_delay + random.uniform(5, 10)
+                            log_message(f"Waiting {wait_time} seconds before replying")
+                            time.sleep(wait_time)
+                            send_message(channel_id, response_text, reply_to=message_id if reply_mode else None, reply_mode=reply_mode)
+                        else:
+                            log_message(f"Ignored message (no mention/reply/project): {content}")
+                    last_message_id = message_id
+                else:
+                    log_message("No messages found in channel.")
             read_wait = read_delay + random.uniform(10, 20)
             log_message(f"Waiting {read_wait} seconds before checking for new messages")
             time.sleep(read_wait)
         except requests.exceptions.RequestException as e:
-            log_message(f"Request error: {e}")
+            log_message(f"⚠️ Request error: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                log_message(f"API response: {e.response.text}")
             time.sleep(read_delay)
     log_message("Chatbot stopped")
 
