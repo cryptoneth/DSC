@@ -8,6 +8,7 @@ import threading
 from datetime import datetime
 from cryptography.fernet import Fernet
 import base64
+from queue import Queue
 
 # Global variables
 last_message_id = None
@@ -17,6 +18,7 @@ last_bot_message_id = None
 bot_running = False
 discord_token = None
 google_api_key = None
+message_queue = Queue()
 
 session = requests.Session()
 
@@ -151,11 +153,11 @@ def configure_settings():
         "character_name": input("Enter character name (e.g., Crypton): ").strip(),
         "personality": input("Enter personality (e.g., Crypto researcher with 7 years experience, part-time trader, programmer, runs Telegram/Twitter with 15k followers, joins promising Web3 projects, loves crypto): ").strip(),
         "project_details": {
-            "name": input("Enter project name (e.g., Altius Labs): ").strip(),
-            "description": input("Enter project description: ").strip(),
-            "key_features": input("Enter key features (comma-separated): ").strip()
+            "name": input("Enter project name (e.g., Altius Labs): ").strip() or "Altius Labs",
+            "description": input("Enter project description (press Enter for default): ").strip() or "Altius Labs offers a VM-agnostic modular execution layer for Web3, boosting blockchain speed, slashing costs, and enabling seamless cross-chain interactions. It tackles congestion and scalability by separating execution from the blockchain’s core, supporting any chain like EVM or Solana. With gigagas-per-second performance, it ensures smooth, decentralized DeFi, NFT, and dApp experiences. Built by crypto and HFT experts, Altius empowers a scalable, multi-chain future with secure, user-friendly tech.",
+            "key_features": input("Enter key features (comma-separated, press Enter for default): ").strip() or "modular execution layer, high-speed transactions, low-cost transactions, cross-chain interoperability, VM-agnostic compatibility, parallel processing, scalable storage, decentralized design"
         },
-        "project_keywords": input("Enter project keywords (comma-separated): ").strip(),
+        "project_keywords": input("Enter project keywords (comma-separated, press Enter for default): ").strip() or "Web3, blockchain, DeFi, modular execution, cross-chain, scalability, low-cost transactions, VM-agnostic, parallel processing, decentralized, yield farming, dApps",
         "discord_token": input("Enter Discord Token: ").strip(),
         "google_api_key": input("Enter Google API Key: ").strip(),
         "channel_id": input("Enter Discord Channel ID: ").strip(),
@@ -179,7 +181,7 @@ def get_rate_limit_info(response):
     return remaining, reset_after
 
 def send_typing(channel_id):
-    """Send typing indicator"""
+    """Send typing indicator (reduced frequency to avoid rate limits)"""
     headers = {
         'Authorization': f'{discord_token}',
         'User-Agent': 'Mozilla/5.0'
@@ -190,10 +192,48 @@ def send_typing(channel_id):
             retry_after = response.json().get("retry_after", 3)
             log_message(f"⚠️ Typing indicator rate limit hit! Waiting {retry_after} seconds...")
             time.sleep(retry_after)
-            return
+            return False
         log_message("⌨️ Typing indicator sent...")
+        return True
     except requests.exceptions.RequestException as e:
         log_message(f"⚠️ Typing indicator error: {e}")
+        return False
+
+def send_message(channel_id, message_text, reply_to=None, reply_mode=True):
+    """Send message to Discord with rate limit handling"""
+    global last_bot_message_id
+    headers = {
+        'Authorization': f'{discord_token}',
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0'
+    }
+    payload = {'content': message_text}
+    if reply_mode and reply_to:
+        payload['message_reference'] = {'message_id': reply_to}
+
+    while True:
+        try:
+            if send_typing(channel_id):
+                time.sleep(random.uniform(5, 10))
+            response = session.post(f"https://discord.com/api/v9/channels/{channel_id}/messages", json=payload, headers=headers)
+            remaining, reset_after = get_rate_limit_info(response)
+            if response.status_code == 429:
+                retry_after = response.json().get("retry_after", reset_after)
+                log_message(f"⚠️ Rate limit hit! Waiting {retry_after} seconds...")
+                time.sleep(retry_after + 1)
+                continue
+            response.raise_for_status()
+            last_bot_message_id = response.json().get('id')
+            log_message(f"✅ Sent message: {message_text}")
+            if remaining == 0:
+                log_message(f"⚠️ Rate limit almost hit! Waiting {reset_after} seconds...")
+                time.sleep(reset_after)
+            break
+        except requests.exceptions.RequestException as e:
+            log_message(f"⚠️ Request error: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                log_message(f"API response: {e.response.text}")
+            time.sleep(5)
 
 def read_personality():
     """Read personality and character name from settings"""
@@ -254,6 +294,7 @@ def update_project_file():
 def post_proactive_message(channel_id, delay):
     """Post proactive messages at specified interval based on recent messages"""
     while bot_running:
+        start_time = time.time()
         try:
             # Fetch recent messages for context (up to 20)
             headers = {'Authorization': f'{discord_token}', 'User-Agent': 'Mozilla/5.0'}
@@ -271,7 +312,7 @@ def post_proactive_message(channel_id, delay):
                 f"Tone: {tone}\n"
                 f"Generate a short (5-10 words), casual message to join the conversation, "
                 f"using Discord slang, relevant to the chat or project, in English. "
-                f"Do not use your name unless necessary."
+                f"Do not use your name or emojis."
             )
             data = {
                 'contents': [{
@@ -288,11 +329,16 @@ def post_proactive_message(channel_id, delay):
             log_message(f"⚠️ Failed to post proactive message: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 log_message(f"API response: {e.response.text}")
-        time.sleep(delay)
+        elapsed_time = time.time() - start_time
+        remaining_delay = max(0, delay - elapsed_time)
+        log_message(f"Waiting {remaining_delay} seconds for next proactive message...")
+        time.sleep(remaining_delay)
 
-def reply_to_random_message(channel_id, delay):
+def reply_to_random_message(channel_id, delay, reply_mode):
     """Read and reply to a random recent message at specified interval"""
+    global last_message_id
     while bot_running:
+        start_time = time.time()
         try:
             # Fetch recent messages (up to 20)
             headers = {'Authorization': f'{discord_token}', 'User-Agent': 'Mozilla/5.0'}
@@ -309,17 +355,23 @@ def reply_to_random_message(channel_id, delay):
                     log_message(f"Selected random message ID: {message_id}, Content: {content}")
                     response_text = generate_reply(content, use_google_ai=True)
                     send_message(channel_id, response_text, reply_to=message_id if reply_mode else None, reply_mode=reply_mode)
+                    last_message_id = message_id
             else:
                 log_message("No messages found for random reply.")
         except requests.exceptions.RequestException as e:
             log_message(f"⚠️ Failed to reply to random message: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 log_message(f"API response: {e.response.text}")
-        time.sleep(delay)
+        elapsed_time = time.time() - start_time
+        remaining_delay = max(0, delay - elapsed_time)
+        log_message(f"Waiting {remaining_delay} seconds for next random reply...")
+        time.sleep(remaining_delay)
 
-def reply_to_direct_replies(channel_id, delay):
+def reply_to_direct_replies(channel_id, delay, reply_mode):
     """Check for direct replies to the bot and respond after specified delay"""
+    global last_message_id
     while bot_running:
+        start_time = time.time()
         try:
             # Fetch recent messages (up to 20)
             headers = {'Authorization': f'{discord_token}', 'User-Agent': 'Mozilla/5.0'}
@@ -341,12 +393,16 @@ def reply_to_direct_replies(channel_id, delay):
                         if is_bot_accusation(content):
                             response_text = random.choice(bot_denial_responses)
                         send_message(channel_id, response_text, reply_to=message_id if reply_mode else None, reply_mode=reply_mode)
+                        last_message_id = message_id
             last_message_id = messages[0].get('id') if messages else last_message_id
         except requests.exceptions.RequestException as e:
             log_message(f"⚠️ Failed to check direct replies: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 log_message(f"API response: {e.response.text}")
-        time.sleep(delay)
+        elapsed_time = time.time() - start_time
+        remaining_delay = max(0, delay - elapsed_time)
+        log_message(f"Waiting {remaining_delay} seconds for next direct reply check...")
+        time.sleep(remaining_delay)
 
 def is_personal_question(prompt):
     """Detect personal questions"""
@@ -535,7 +591,7 @@ def generate_reply(prompt, use_google_ai=True):
         for attempt in range(3):
             try:
                 response = session.post(url, headers=headers, json=data)
-                if response.status_code == 429:  # Rate limit error
+                if response.status_code == 429:
                     retry_after = response.json().get("retry_after", 60)
                     log_message(f"⚠️ Rate limit hit! Waiting {retry_after} seconds...")
                     time.sleep(retry_after)
@@ -582,42 +638,6 @@ def generate_reply(prompt, use_google_ai=True):
                 return f"Whoops {random_vocab} something broke try again later"
     return f"Can't chat now {random_vocab} catch ya later"
 
-def send_message(channel_id, message_text, reply_to=None, reply_mode=True):
-    """Send message to Discord"""
-    global last_bot_message_id
-    headers = {
-        'Authorization': f'{discord_token}',
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0'
-    }
-    payload = {'content': message_text}
-    if reply_mode and reply_to:
-        payload['message_reference'] = {'message_id': reply_to}
-
-    while True:
-        try:
-            send_typing(channel_id)
-            time.sleep(random.uniform(5, 10))
-            response = session.post(f"https://discord.com/api/v9/channels/{channel_id}/messages", json=payload, headers=headers)
-            remaining, reset_after = get_rate_limit_info(response)
-            if response.status_code == 429:
-                retry_after = response.json().get("retry_after", reset_after)
-                log_message(f"⚠️ Rate limit hit! Waiting {retry_after} seconds...")
-                time.sleep(retry_after + 1)
-                continue
-            response.raise_for_status()
-            last_bot_message_id = response.json().get('id')
-            log_message(f"✅ Sent message: {message_text}")
-            if remaining == 0:
-                log_message(f"⚠️ Rate limit almost hit! Waiting {reset_after} seconds...")
-                time.sleep(reset_after)
-            break
-        except requests.exceptions.RequestException as e:
-            log_message(f"⚠️ Request error: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                log_message(f"API response: {e.response.text}")
-            time.sleep(5)
-
 def auto_reply(channel_id, random_read_reply_delay, direct_reply_check_delay, use_google_ai, reply_mode):
     global last_message_id, bot_user_id, last_bot_message_id, bot_running
     headers = {'Authorization': f'{discord_token}', 'User-Agent': 'Mozilla/5.0'}
@@ -644,8 +664,8 @@ def auto_reply(channel_id, random_read_reply_delay, direct_reply_check_delay, us
     proactive_delay = settings["proactive_delay"] if settings else 3600
     threading.Thread(target=update_project_file, daemon=True).start()
     threading.Thread(target=post_proactive_message, args=(channel_id, proactive_delay), daemon=True).start()
-    threading.Thread(target=reply_to_random_message, args=(channel_id, random_read_reply_delay), daemon=True).start()
-    threading.Thread(target=reply_to_direct_replies, args=(channel_id, direct_reply_check_delay), daemon=True).start()
+    threading.Thread(target=reply_to_random_message, args=(channel_id, random_read_reply_delay, reply_mode), daemon=True).start()
+    threading.Thread(target=reply_to_direct_replies, args=(channel_id, direct_reply_check_delay, reply_mode), daemon=True).start()
 
 def main():
     """Main function"""
