@@ -30,6 +30,14 @@ def log_message(message):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"{timestamp} - {message}")
 
+def sanitize_input(text):
+    """Sanitize input to remove invalid UTF-8 characters"""
+    try:
+        return text.encode('utf-8', 'ignore').decode('utf-8')
+    except Exception as e:
+        log_message(f"⚠️ Error sanitizing input: {e}")
+        return text
+
 def load_settings():
     """Load settings from settings.json, return None if incomplete or error"""
     global discord_token, google_api_key
@@ -64,6 +72,12 @@ def load_settings():
         return None
     except json.JSONDecodeError as e:
         log_message(f"⚠️ JSON decode error in settings file: {e}")
+        # Rename corrupted file to avoid repeated errors
+        try:
+            os.rename(SETTINGS_FILE, f"{SETTINGS_FILE}.bak")
+            log_message(f"⚠️ Renamed corrupted settings file to {SETTINGS_FILE}.bak")
+        except Exception as rename_e:
+            log_message(f"⚠️ Error renaming settings file: {rename_e}")
         return None
     except Exception as e:
         log_message(f"⚠️ Error loading settings: {e}")
@@ -85,7 +99,14 @@ def save_settings(settings):
         if not all(key in settings["project_details"] for key in ["name", "description", "key_features"]):
             log_message("⚠️ Cannot save settings: Missing project details fields.")
             return False
+        # Sanitize string inputs to remove invalid UTF-8 characters
         save_data = settings.copy()
+        for key in ["tone", "character_name", "personality", "project_keywords", "discord_token", "google_api_key", "channel_id"]:
+            if key in save_data and isinstance(save_data[key], str):
+                save_data[key] = sanitize_input(save_data[key])
+        for key in ["name", "description", "key_features"]:
+            if key in save_data["project_details"] and isinstance(save_data["project_details"][key], str):
+                save_data["project_details"][key] = sanitize_input(save_data["project_details"][key])
         # Encrypt tokens
         try:
             if save_data.get("discord_token"):
@@ -545,7 +566,13 @@ def auto_reply(channel_id, read_delay, reply_delay, use_google_ai, reply_mode):
         bot_user_id = bot_info_response.json().get('id')
         log_message(f"✅ Bot user ID: {bot_user_id}")
         # Send short, non-clichéd initial message
-        welcome_message = f"{read_personality()[1]}’s here, what’s the Web3 buzz?"
+        welcome_messages = [
+            f"{read_personality()[1]}’s here, what’s the Web3 buzz?",
+            f"{read_personality()[1]}’s in, any Web3 heat?",
+            f"Yo, {read_personality()[1]}, droppin’ crypto vibes!",
+            f"{read_personality()[1]}’s up, what’s Web3 cookin’?"
+        ]
+        welcome_message = random.choice(welcome_messages)
         send_message(channel_id, welcome_message)
     except requests.exceptions.RequestException as e:
         log_message(f"⚠️ Failed to retrieve bot information: {e}")
